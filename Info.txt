@@ -1,0 +1,12 @@
+# 1. Datei erstellen
+nano install_nexus.sh
+
+# 2. Code einfügen (STRG+SHIFT+V oder Rechtsklick -> Einfügen)
+
+# 3. Speichern (STRG+X, dann Y, dann ENTER)
+
+# 4. Ausführbar machen
+chmod +x install_nexus.sh
+
+# 5. Ausführen
+./install_nexus.sh
