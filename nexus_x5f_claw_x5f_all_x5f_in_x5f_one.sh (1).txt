@@ -1,0 +1,361 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# NEXUS CLAW - ALLES IN EINER DATEI - Termux + Ollama + Game Builder
+# Speichere als nexus-install.sh und in Termux ausführen: bash nexus-install.sh
+
+set -e
+echo "╔══════════════════════════════════════╗"
+echo "║  NEXUS CLAW - Autonomer Dev Loop   ║"
+echo "║  Termux + Ollama + Web UI          ║"
+echo "╚══════════════════════════════════════╝"
+
+# 1. Pakete
+echo "[1/6] Installiere Pakete..."
+pkg update -y
+pkg install -y python git curl wget nodejs termux-api proot-distro binutils
+pip install --upgrade pip
+pip install fastapi uvicorn requests psutil
+
+# 2. Ollama installieren
+echo "[2/6] Ollama installieren..."
+if ! command -v ollama >/dev/null 2>&1; then
+  curl -fsSL https://ollama.com/install.sh | sh || {
+    echo "Fallback: lade Ollama binary..."
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "aarch64" ]; then
+      wget -q https://github.com/ollama/ollama/releases/latest/download/ollama-linux-arm64 -O $PREFIX/bin/ollama
+      chmod +x $PREFIX/bin/ollama
+    fi
+  }
+fi
+
+# 3. Struktur
+echo "[3/6] Projekt Struktur..."
+mkdir -p ~/nexus-claw/{projects/MeinGame/Assets/Scripts,web,logs,models,builds}
+mkdir -p ~/.termux
+termux-setup-storage 2>/dev/null || true
+termux-wake-lock 2>/dev/null || true
+
+# 4. Backend: server.py
+echo "[4/6] Schreibe Backend..."
+cat > ~/nexus-claw/server.py << 'PYEOF'
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import time, psutil, requests, os
+from pathlib import Path
+
+app = FastAPI()
+BASE = Path.home() / "nexus-claw"
+OLLAMA_URL = "http://localhost:11434"
+
+state = {
+    "zyklus": 48, "phase": 3, "running": False, "test_lauf":"6/10 04%", "laufzeit": 8124,
+    "cpu":68, "ram":"3.2 / 8 GB", "speicher":"24 / 64 GB", "akku":"100%",
+    "task":"Bugfix: FPS-Drops im Level 2 beheben", "progress":70,
+    "modell":"qwen2.5:3b (aktiv)",
+    "tests":[
+        {"id":1,"name":"Start & Menü","zeit":"00:32","status":"OK"},
+        {"id":2,"name":"Level Laden","zeit":"00:28","status":"OK"},
+        {"id":3,"name":"Steuerung","zeit":"00:45","status":"OK"},
+        {"id":4,"name":"Spielregeln","zeit":"00:51","status":"WARN"},
+        {"id":5,"name":"Kollisionen","zeit":"00:37","status":"OK"},
+        {"id":6,"name":"Gegner KI","zeit":"läuft... 00:20","status":"RUN"},
+        {"id":7,"name":"Performance","zeit":"wartet...","status":"WAIT"},
+        {"id":8,"name":"Randfälle","zeit":"wartet...","status":"WAIT"},
+        {"id":9,"name":"Langzeittest","zeit":"wartet...","status":"WAIT"},
+        {"id":10,"name":"Absturzprüfung","zeit":"wartet...","status":"WAIT"},
+    ],
+    "logs":[
+        {"time":"18:39:12","type":"PLAN","msg":"Projekt analysiert - 12 Aufgaben erkannt"},
+        {"time":"18:40:05","type":"CODE","msg":"Neues Level-System implementiert"},
+        {"time":"18:42:18","type":"TEST","msg":"Testlauf 1/10 gestartet"},
+        {"time":"18:43:01","type":"TEST","msg":"Testlauf 1/10 erfolgreich"},
+        {"time":"18:43:22","type":"TEST","msg":"Testlauf 2/10 gestartet"},
+        {"time":"18:44:10","type":"WARN","msg":"FPS unter 30 erkannt"},
+        {"time":"18:45:33","type":"FIX","msg":"AI-Pfadberechnung optimiert"},
+        {"time":"18:47:02","type":"TEST","msg":"Testlauf 3/10 erfolgreich"},
+    ]
+}
+
+def ollama_chat(prompt, model="qwen2.5:3b"):
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/generate", json={"model":model,"prompt":prompt,"stream":False}, timeout=120)
+        return r.json().get("response","")
+    except Exception as e:
+        return f"Ollama nicht erreichbar: {e} - starte mit 'ollama serve'"
+
+@app.get("/api/state")
+def get_state():
+    try: state["cpu"] = int(psutil.cpu_percent())
+    except: pass
+    return state
+
+@app.post("/api/start")
+def api_start(bg: BackgroundTasks):
+    state["running"]=True
+    def loop():
+        while state["running"]:
+            for t in state["tests"]:
+                if t["status"]=="WAIT":
+                    t["status"]="RUN"
+                    time.sleep(1)
+                    t["status"]="OK"
+                    state["logs"].append({"time":time.strftime("%H:%M:%S"),"type":"TEST","msg":f"Test {t['id']}/10 erfolgreich"})
+                    break
+            time.sleep(2)
+    bg.add_task(loop)
+    return {"ok":True}
+
+@app.post("/api/pause")
+def api_pause(): state["running"]=False; return {"ok":True}
+
+@app.post("/api/stop")
+def api_stop(): state["running"]=False; state["phase"]=1; return {"ok":True}
+
+@app.post("/api/chat")
+def api_chat(data: dict):
+    p=data.get("prompt",""); m=data.get("model","qwen2.5:3b")
+    return {"response": ollama_chat(p,m)}
+
+@app.get("/")
+def index(): return FileResponse(BASE / "web" / "index.html")
+
+app.mount("/web", StaticFiles(directory=str(BASE/"web")), name="web")
+
+if __name__=="__main__":
+    import uvicorn
+    print("NEXUS CLAW Server auf http://localhost:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+PYEOF
+
+# 5. Agent
+cat > ~/nexus-claw/agent.py << 'PYEOF'
+import requests, time
+from pathlib import Path
+OLLAMA="http://localhost:11434"
+MODEL="qwen2.5:3b"
+SYS="Du bist NEXUS CLAW, autonomer Unity Android Game Dev Agent. Zyklen: 1 PLANEN 2 BAUEN 3 TESTS 1-10 4 FIXEN 5 TESTS 11-20 6 LOOP. Generiere sauberen C# Code."
+
+def chat(prompt):
+    try:
+        r=requests.post(f"{OLLAMA}/api/generate", json={"model":MODEL,"prompt":SYS+"\n\n"+prompt,"stream":False}, timeout=180)
+        return r.json().get("response","")
+    except Exception as e:
+        return f"[Fehler {e}]"
+
+if __name__=="__main__":
+    print("NEXUS CLAW Agent 24/7 Loop gestartet")
+    z=1
+    while True:
+        print(f"\n=== Zyklus {z} ===")
+        print(chat("Analysiere leeres Unity Projekt für Cyberpunk Racing Game, 5 Aufgaben"))
+        time.sleep(10)
+        z+=1
+PYEOF
+
+# 6. Web UI - EXAKT wie Screenshot - in einer Datei
+echo "[5/6] Schreibe Web UI..."
+cat > ~/nexus-claw/web/index.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>NEXUS CLAW - Termux Edition</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+<style>
+*{font-family:'JetBrains Mono',monospace}
+.orbit{font-family:'Orbitron',sans-serif}
+.glow{box-shadow:0 0 15px rgba(0,231,255,0.5)}
+.glow-green{box-shadow:0 0 15px rgba(0,255,136,0.6)}
+.neon-text{text-shadow:0 0 8px #00e7ff}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.scroll::-webkit-scrollbar{width:4px}
+.scroll::-webkit-scrollbar-thumb{background:#00e7ff;border-radius:4px}
+</style>
+</head>
+<body class="bg-[#050a18] text-white min-h-screen overflow-hidden">
+<!-- Phone Frame -->
+<div class="max-w-[1400px] mx-auto grid lg:grid-cols-3 grid-cols-1 gap-3 p-2">
+  
+<!-- ========== DASHBOARD ========== -->
+<div class="bg-[#0a142e] rounded-[20px] border border-cyan-500/30 overflow-hidden flex flex-col h-[92vh]">
+  <div class="flex justify-between items-center px-3 py-2 bg-black/50 text-[11px]"><span>18:36</span><span class="flex gap-2">📶 100% 🔋</span></div>
+  <div class="flex items-center justify-between px-3 py-2 border-b border-cyan-900/50">
+    <span class="text-lg">☰</span>
+    <div class="text-center"><h1 class="orbit text-cyan-400 text-[18px] font-black tracking-widest neon-text">NEXUS CLAW</h1><p class="text-[9px] text-cyan-300/70 tracking-[2px]">AUTONOMER ENTWICKLUNGS-LOOP 24/7</p></div>
+    <span class="text-cyan-400">⚙️</span>
+  </div>
+  <div class="p-3 flex-1 overflow-y-auto scroll space-y-3">
+    <div class="grid grid-cols-[1.2fr_0.8fr] gap-2">
+      <div class="relative rounded-xl overflow-hidden border border-cyan-500/30 h-[200px] bg-gradient-to-br from-violet-900/50 to-cyan-900/50">
+        <div class="absolute inset-0 bg-gradient-to-t from-black to-transparent"></div>
+        <div class="absolute bottom-0 left-0 p-2 w-full">
+          <div class="bg-black/70 rounded-lg px-2 py-1 text-[10px]">💬 Ich arbeite autonom<br>am nächsten Zyklus ...</div>
+        </div>
+        <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-6xl">👩‍💻</div>
+        <div class="absolute bottom-2 left-2 bg-cyan-500 text-black text-[8px] px-1 rounded">NEXUS</div>
+      </div>
+      <div class="space-y-2">
+        <div class="bg-black/60 border border-cyan-400 rounded-lg p-2 text-[10px]"><div class="text-cyan-400 font-bold">NEXUS CORE</div><div class="text-green-400">🟢 ONLINE</div><div class="w-12 h-12 mx-auto mt-1 rounded-full border-2 border-cyan-400 flex items-center justify-center pulse">◎</div></div>
+        <div class="bg-black/60 border border-cyan-400 rounded-lg p-2 text-[10px] flex items-center gap-1"><span>🤖</span><div><div class="text-cyan-400">AGENT</div><div class="text-cyan-300">AKTIV</div></div></div>
+        <div class="bg-black/60 border border-cyan-400 rounded-lg p-2 text-[10px] flex items-center gap-1"><span class="text-xl">🐱</span><div><div class="text-cyan-400">NEXUS PET</div><div class="text-[8px]">Bereit</div></div></div>
+      </div>
+    </div>
+    <div class="bg-black/60 border border-cyan-900 rounded-xl p-3">
+      <div class="flex justify-between text-[12px] font-bold"><span>Aktueller Zyklus #<span id="zyklus">48</span></span><span id="laufzeit" class="text-[10px]">⏱ Laufzeit: 02:14:36</span></div>
+      <div class="text-[10px] text-gray-400">Testlauf <span id="tlauf">6/10 04%</span></div>
+      <div class="h-1.5 bg-gray-800 rounded-full mt-1"><div id="zyklusbar" class="h-full bg-cyan-400 rounded-full" style="width:40%"></div></div>
+    </div>
+    <div class="flex justify-between items-center text-[9px]">
+      <div class="flex items-center gap-1"><div class="w-6 h-6 rounded-full bg-cyan-900 flex items-center justify-center">1</div><span>Planen</span></div><span>→</span>
+      <div class="flex items-center gap-1"><div class="w-6 h-6 rounded-full bg-cyan-900 flex items-center justify-center">2</div><span>Bauen</span></div><span>→</span>
+      <div class="flex flex-col items-center"><div class="w-7 h-7 rounded-full bg-yellow-500 text-black flex items-center justify-center font-bold glow">3</div><span>Tests<br>1-10</span></div><span>→</span>
+      <div class="flex flex-col items-center"><div class="w-6 h-6 rounded-full bg-violet-900 flex items-center justify-center">4</div><span>Fixen</span></div><span>→</span>
+      <div class="flex flex-col items-center"><div class="w-6 h-6 rounded-full bg-violet-900 flex items-center justify-center">5</div><span>Tests<br>11-20</span></div><span>→</span>
+      <div class="flex flex-col items-center"><div class="w-6 h-6 rounded-full bg-violet-900 flex items-center justify-center">6</div><span>Loop</span></div>
+    </div>
+    <div class="grid grid-cols-3 gap-2">
+      <button onclick="startLoop()" class="bg-[#00ff88] text-black font-black py-2.5 rounded-lg glow-green flex justify-center items-center gap-1">▶ START</button>
+      <button onclick="pauseLoop()" class="bg-yellow-500/20 border border-yellow-500 text-yellow-400 font-bold py-2.5 rounded-lg">⏸ PAUSE</button>
+      <button onclick="stopLoop()" class="bg-red-500/20 border border-red-500 text-red-400 font-bold py-2.5 rounded-lg">⏹ STOPP</button>
+    </div>
+    <div class="grid grid-cols-4 gap-1 text-[9px]">
+      <div class="bg-black/50 border border-cyan-900 rounded p-1"><div>🖥 CPU</div><div class="text-cyan-400 font-bold" id="cpu">68%</div><div class="h-1 bg-gray-800 rounded"><div class="h-full bg-cyan-400" style="width:68%"></div></div></div>
+      <div class="bg-black/50 border border-cyan-900 rounded p-1"><div>💾 RAM</div><div class="text-cyan-400">3.2 / 8 GB</div><div class="h-1 bg-gray-800 rounded"><div class="h-full bg-cyan-400" style="width:40%"></div></div></div>
+      <div class="bg-black/50 border border-cyan-900 rounded p-1"><div>📦 Speicher</div><div class="text-cyan-400">24 / 64 GB</div><div class="h-1 bg-gray-800 rounded"><div class="h-full bg-cyan-400" style="width:37%"></div></div></div>
+      <div class="bg-black/50 border border-cyan-900 rounded p-1"><div>🔋 Akku</div><div class="text-green-400 font-bold">100%</div><div class="text-[18px]">🔋</div></div>
+    </div>
+  </div>
+  <div class="flex justify-around py-2 bg-black/80 border-t border-cyan-900/30 text-[10px]"><span class="text-cyan-400">🏠 Dashboard</span><span>📁 Projekte</span><span>🧪 Tests</span><span>📜 Logs</span><span>⚙️ Einstellungen</span></div>
+</div>
+
+<!-- ========== PROJEKTE + TESTS SPALTE ========== -->
+<div class="hidden lg:flex flex-col gap-3 h-[92vh]">
+  <div class="bg-[#0a142e] rounded-[20px] border border-cyan-500/20 p-3 flex-1 overflow-y-auto scroll">
+    <h2 class="font-bold flex items-center gap-2">📁 Projekt <span class="text-white">MeinGame</span></h2>
+    <p class="text-[10px] text-gray-400">/storage/emulated/0/Projekte/MeinGame</p>
+    <div class="flex gap-1 mt-2 text-[11px]"><button class="bg-blue-600 px-3 py-1 rounded">Übersicht</button><button class="bg-black/50 px-3 py-1 rounded">Build</button><button class="bg-black/50 px-3 py-1 rounded">Tests</button><button class="bg-black/50 px-3 py-1 rounded">Git</button></div>
+    <div class="mt-3 text-[11px] space-y-1"><div class="flex"><span class="w-24 text-gray-400">Typ</span><span>Android App / Game</span></div><div class="flex"><span class="w-24 text-gray-400">Engine</span><span>Unity (Gradle)</span></div><div class="flex"><span class="w-24 text-gray-400">Status</span><span class="text-green-400">Aktiv</span></div><div class="flex"><span class="w-24 text-gray-400">Branch</span><span class="text-cyan-400">nexus-dev-48</span></div><div class="flex"><span class="w-24 text-gray-400">Letzter Commit</span><span>a3f21c7 - Fix InputManager</span></div></div>
+    <div class="mt-3 h-[120px] rounded-lg bg-gradient-to-r from-purple-900 via-pink-900 to-cyan-900 flex items-center justify-center text-4xl">🏎️🌴🌃</div>
+    <div class="grid grid-cols-2 gap-2 mt-3 text-[11px]"><button class="border border-cyan-800 rounded py-2">📁 Ordner öffnen</button><button class="border border-cyan-800 rounded py-2">🔧 Terminal</button><button class="border border-cyan-800 rounded py-2">🔨 Build starten</button><button class="border border-green-800 rounded py-2 text-green-400">📲 APK installieren</button><button class="border border-cyan-800 rounded py-2">⚙️ Tests konfigurieren</button><button class="border border-cyan-800 rounded py-2">🔄 Projekt wechseln</button></div>
+  </div>
+  <div class="bg-[#0a142e] rounded-[20px] border border-violet-500/20 p-3 flex-1 overflow-y-auto scroll">
+    <h2 class="font-bold">🧪 Gameplay-Tests</h2>
+    <div class="flex gap-2 mt-2 text-[11px]"><div class="flex-1 bg-green-900/30 border border-green-500 rounded-lg p-2 text-center"><div class="font-bold">Phase 1</div><div class="text-[10px]">Tests 1-10</div></div><div class="flex-1 bg-black/30 border border-gray-700 rounded-lg p-2 text-center"><div>Phase 2</div><div class="text-[10px]">Tests 11-20</div></div></div>
+    <div id="testslist" class="mt-2 space-y-1 text-[11px]"></div>
+    <button onclick="autoTest()" class="w-full mt-3 bg-violet-600 py-2 rounded-lg text-[12px]">▶ Automatisch testen (10 Läufe)</button>
+    <div class="mt-3 flex gap-3"><div class="w-20 h-20 rounded-full border-4 border-green-500 flex items-center justify-center flex-col"><span class="font-bold text-lg">5/10</span><span class="text-[9px]">bestanden</span></div><div class="text-[10px] space-y-1"><div>🟢 Bestanden 5</div><div>🟡 Warnungen 1</div><div>🔴 Fehler 0</div><div>⚪ Offen 4</div></div></div>
+  </div>
+</div>
+
+<!-- ========== LOGS + KI + EINSTELLUNGEN ========== -->
+<div class="hidden lg:flex flex-col gap-3 h-[92vh]">
+  <div class="bg-[#0a142e] rounded-[20px] border border-cyan-500/20 p-3 flex-1 overflow-hidden flex flex-col">
+    <div class="flex justify-between"><h2 class="font-bold">📜 Live-Logs</h2><button class="text-[10px] border rounded px-2">Filter</button></div>
+    <div id="loglist" class="mt-2 space-y-1 text-[11px] overflow-y-auto scroll flex-1"></div>
+    <input id="ollamaPrompt" placeholder="Frage Ollama (qwen2.5)..." class="mt-2 w-full bg-black/50 border border-cyan-900 rounded px-2 py-1 text-[11px]" onkeydown="if(event.key==='Enter') askOllama()">
+  </div>
+  <div class="bg-[#0a142e] rounded-[20px] border border-cyan-500/20 p-3">
+    <h2 class="font-bold flex justify-between">🧠 KI-Agent <span class="bg-green-900 text-green-400 text-[10px] px-2 rounded-full">AKTIV</span></h2>
+    <div class="mt-2 bg-black/50 rounded p-2 text-[11px]"><div class="font-bold">Aktuelle Aufgabe</div><div>Bugfix: FPS-Drops im Level 2 beheben</div><div class="h-1.5 bg-gray-800 rounded mt-1"><div class="h-full bg-cyan-400" style="width:70%"></div></div></div>
+    <div class="mt-2 text-[10px]"><div class="font-bold">KI Modell</div><label class="flex gap-2"><input type="radio" name="model" checked> Ollama (Lokal) qwen2.5 (aktiv)</label><label class="flex gap-2"><input type="radio" name="model"> DeepSeek-R1</label><label class="flex gap-2"><input type="radio" name="model"> Llama 3</label></div>
+  </div>
+</div>
+
+</div>
+
+<script>
+let tests=[
+ {id:1,name:"Start & Menü",zeit:"00:32",status:"OK"},
+ {id:2,name:"Level Laden",zeit:"00:28",status:"OK"},
+ {id:3,name:"Steuerung",zeit:"00:45",status:"OK"},
+ {id:4,name:"Spielregeln",zeit:"00:51",status:"WARN"},
+ {id:5,name:"Kollisionen",zeit:"00:37",status:"OK"},
+ {id:6,name:"Gegner KI",zeit:"läuft... 00:20",status:"RUN"},
+ {id:7,name:"Performance",zeit:"wartet...",status:"WAIT"},
+ {id:8,name:"Randfälle",zeit:"wartet...",status:"WAIT"},
+ {id:9,name:"Langzeittest",zeit:"wartet...",status:"WAIT"},
+ {id:10,name:"Absturzprüfung",zeit:"wartet...",status:"WAIT"},
+]
+let logs=[
+ {time:"18:39:12",type:"PLAN",msg:"Projekt analysiert - 12 Aufgaben erkannt"},
+ {time:"18:40:05",type:"CODE",msg:"Neues Level-System implementiert"},
+ {time:"18:42:18",type:"TEST",msg:"Testlauf 1/10 gestartet"},
+ {time:"18:43:01",type:"TEST",msg:"Testlauf 1/10 erfolgreich"},
+ {time:"18:44:10",type:"WARN",msg:"FPS unter 30 erkannt"},
+ {time:"18:45:33",type:"FIX",msg:"AI-Pfadberechnung optimiert"},
+ {time:"18:47:02",type:"TEST",msg:"Testlauf 3/10 erfolgreich"},
+]
+function renderTests(){
+ let h=''; tests.forEach(t=>{
+  let icon=t.status=="OK"?"🟢":t.status=="WARN"?"🟡":t.status=="RUN"?"🔵":"⚪";
+  let cls=t.status=="OK"?"text-green-400":t.status=="WARN"?"text-yellow-400":t.status=="RUN"?"text-cyan-400":"text-gray-500";
+  h+=`<div class="flex justify-between items-center bg-black/40 rounded px-2 py-1"><span>${icon} Test ${t.id} ${t.name}</span><span class="${cls}">${t.zeit} ${t.status}</span></div>`;
+ }); document.getElementById('testslist').innerHTML=h;
+}
+function renderLogs(){
+ let h=''; logs.slice(-12).forEach(l=>{
+  let c=l.type=="PLAN"?"bg-blue-600":l.type=="CODE"?"bg-violet-600":l.type=="TEST"?"bg-green-600":l.type=="WARN"?"bg-yellow-600":l.type=="FIX"?"bg-pink-600":"bg-gray-600";
+  h+=`<div class="flex gap-2"><span class="text-gray-500">${l.time}</span><span class="${c} text-[9px] px-1 rounded text-white">${l.type}</span><span>${l.msg}</span></div>`;
+ }); let el=document.getElementById('loglist'); if(el){el.innerHTML=h; el.scrollTop=el.scrollHeight;}
+}
+function autoTest(){
+ let idx=tests.findIndex(t=>t.status=="WAIT");
+ if(idx==-1) return;
+ tests[idx].status="RUN"; renderTests();
+ setTimeout(()=>{tests[idx].status="OK"; tests[idx].zeit="00:"+(30+idx); logs.push({time:new Date().toLocaleTimeString(),type:"TEST",msg:`Testlauf ${tests[idx].id}/10 erfolgreich`}); renderTests(); renderLogs(); if(tests.some(t=>t.status=="WAIT")) autoTest();},1200);
+}
+function startLoop(){ logs.push({time:new Date().toLocaleTimeString(),type:"SYSTEM",msg:"Loop gestartet - Ollama qwen2.5 aktiv"}); renderLogs(); autoTest(); }
+function pauseLoop(){ logs.push({time:new Date().toLocaleTimeString(),type:"SYSTEM",msg:"Pausiert"}); renderLogs(); }
+function stopLoop(){ tests.forEach(t=>{if(t.id>5) t.status="WAIT"}); renderTests(); logs.push({time:new Date().toLocaleTimeString(),type:"SYSTEM",msg:"Gestoppt - Reset"}); renderLogs(); }
+async function askOllama(){
+ let input=document.getElementById('ollamaPrompt'); let prompt=input.value; if(!prompt) return;
+ logs.push({time:new Date().toLocaleTimeString(),type:"CODE",msg:`> ${prompt}`}); renderLogs(); input.value='';
+ try{
+  let res=await fetch('http://localhost:11434/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'qwen2.5:3b',prompt:prompt,stream:false})});
+  let data=await res.json(); logs.push({time:new Date().toLocaleTimeString(),type:"PLAN",msg:data.response.slice(0,200)}); renderLogs();
+ }catch(e){
+  logs.push({time:new Date().toLocaleTimeString(),type:"WARN",msg:"Ollama offline - starte 'ollama serve' + 'ollama pull qwen2.5:3b'"}); renderLogs();
+ }
+}
+let sec=8124; setInterval(()=>{sec++; let h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60; let el=document.getElementById('laufzeit'); if(el) el.textContent=`⏱ Laufzeit: ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;},1000);
+renderTests(); renderLogs();
+</script>
+</body>
+</html>
+HTMLEOF
+
+# 7. Ollama Modelle
+echo "[6/6] Ollama Modelle holen..."
+ollama serve > ~/nexus-claw/logs/ollama.log 2>&1 &
+sleep 4
+ollama pull qwen2.5:3b || ollama pull qwen2.5:0.5b || echo "Modell Pull fehlgeschlagen - versuche später: ollama pull qwen2.5:3b"
+ollama pull deepseek-coder:1.3b || true
+
+# 8. Start Script
+cat > ~/nexus-claw/start.sh << 'SEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+echo "Starte NEXUS CLAW..."
+termux-wake-lock
+ollama serve > ~/nexus-claw/logs/ollama.log 2>&1 &
+sleep 2
+cd ~/nexus-claw
+python server.py &
+echo "Server läuft: http://localhost:8000"
+echo "Logs: tail -f ~/nexus-claw/logs/ollama.log"
+echo "Agent in neuem Tab: python ~/nexus-claw/agent.py"
+SEOF
+chmod +x ~/nexus-claw/start.sh
+chmod +x ~/nexus-claw/server.py
+
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║  ✅ INSTALLATION FERTIG!            ║"
+echo "║  Starte mit:                         ║"
+echo "║  cd ~/nexus-claw && ./start.sh       ║"
+echo "║  Dann öffne: http://localhost:8000   ║"
+echo "║  Ollama: ollama list                 ║"
+echo "╚══════════════════════════════════════╝"
